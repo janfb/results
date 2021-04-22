@@ -50,6 +50,7 @@ def main(cfg: DictConfig) -> None:
     path_samples = "posterior_samples.csv.bz2"
     path_runtime = "runtime.csv"
     path_log_prob_true_parameters = "log_prob_true_parameters.csv"
+    path_map = "map.csv"
     path_num_simulations_simulator = "num_simulations_simulator.csv"
     path_predictive_samples = "predictive_samples.csv.bz2"
 
@@ -76,18 +77,20 @@ def main(cfg: DictConfig) -> None:
         samples = outputs
         num_simulations_simulator = float("nan")
         log_prob_true_parameters = float("nan")
-    elif type(outputs) == tuple and len(outputs) == 3:
+    elif type(outputs) == tuple and len(outputs) == 4:
         samples = outputs[0]
         num_simulations_simulator = float(outputs[1])
         log_prob_true_parameters = (
             float(outputs[2]) if outputs[2] is not None else float("nan")
         )
+        map_estimate = outputs[3]
     else:
         raise NotImplementedError
     save_tensor_to_csv(path_samples, samples, columns=task.get_labels_parameters())
     save_float_to_csv(path_runtime, runtime)
     save_float_to_csv(path_num_simulations_simulator, num_simulations_simulator)
     save_float_to_csv(path_log_prob_true_parameters, log_prob_true_parameters)
+    save_float_to_csv(path_map, map_estimate)
 
     # Predictive samples
     log.info("Draw posterior predictive samples")
@@ -146,7 +149,7 @@ def compute_metrics_df(
     log: logging.Logger = logging.getLogger(__name__),
 ) -> pd.DataFrame:
     """Compute all metrics, returns dataframe
-    
+
     Args:
         task_name: Task
         num_observation: Observation
@@ -155,7 +158,7 @@ def compute_metrics_df(
         path_predictive_samples: Path to predictive samples
         path_log_prob_true_parameters: Path to NLTP
         log: Logger
-    
+
     Returns:
         Dataframe with results
     """

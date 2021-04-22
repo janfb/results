@@ -11,8 +11,9 @@ import sbibm
 import torch
 from deneb.utils import rgb2hex
 from omegaconf import OmegaConf
-from sbibm.utils.io import get_float_from_csv
+from sbibm.utils.io import get_float_from_csv, get_tensor_from_csv
 from tqdm.auto import tqdm
+from sbibm.metrics import c2st
 
 log = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ def get_colors(
         column: Column containing algorithms
         hex: If True, will return hex values instead of RGB strings
         include_defaults: If True, will include default colors in returned dict
-    
+
     Returns:
         Dictionary mapping algorithms to colors
     """
@@ -112,14 +113,17 @@ def get_df(
 
 
 def get_float_from_csv(
-    path: Union[str, Path], dtype: type = np.float32,
+    path: Union[str, Path],
+    dtype: type = np.float32,
 ):
     """Get a single float from a csv file"""
     with open(path, "r") as fh:
         return np.loadtxt(fh).astype(dtype)
 
 
-def compile_df(basepath: str,) -> pd.DataFrame:
+def compile_df(
+    basepath: str,
+) -> pd.DataFrame:
     """Compile dataframe for further analyses
 
     `basepath` is the path to a folder over which to recursively loop. All information
@@ -156,8 +160,52 @@ def compile_df(basepath: str,) -> pd.DataFrame:
             continue
         row["num_simulations"] = cfg["task"]["num_simulations"]
         row["num_observation"] = cfg["task"]["num_observation"]
-        row["algorithm"] = cfg["algorithm"]["name"]
+        row["num_rounds"] = cfg["algorithm"]["params"]["num_rounds"]
+        num_rounds = cfg["algorithm"]["params"]["num_rounds"]
+        if cfg["algorithm"]["params"]["cold"]:
+            row["algorithm"] = (
+                cfg["algorithm"]["name"] + "-cold" + f"-{num_rounds}rounds"
+            )
+        else:
+            row["algorithm"] = cfg["algorithm"]["name"] + f"-{num_rounds}rounds"
         row["seed"] = cfg["seed"]
+
+        # add MAP distance
+        task = sbibm.get_task(row["task"])
+        samples = get_tensor_from_csv(path_metrics.parent / "posterior_samples.csv.bz2")
+        observation = task.get_observation(row["num_observation"])
+        true_samples = task.get_reference_posterior_samples(row["num_observation"])
+        if row["task"] == "gaussian_linear":
+            true_cold_samples = get_gaussian_linear_cold_posterior_samples(
+                task, row["num_observation"], num_rounds, num_samples=1000
+            )
+        elif row["task"] == "gaussian_linear_uniform":
+            true_cold_samples = get_gaussian_linear_uniform_cold_posterior_samples(
+                task, row["num_observation"], num_rounds, num_samples=1000
+            )
+        else:
+            raise ValueError
+
+        true_map_mle = observation
+        map_estimate = get_tensor_from_csv(path_metrics.parent / "map.csv")
+        _map = map_estimate
+        _mle = map_estimate
+        row["MAP/MLE_ERR"] = torch.norm(_map - true_map_mle).numpy()
+        row["MLE_ERR"] = torch.norm(_mle - true_map_mle).numpy()
+        row["MEAN_ERR"] = torch.norm(samples.mean(0) - true_samples.mean(0)).numpy()
+        row["cold_MEAN_ERR"] = torch.norm(
+            samples.mean(0) - true_cold_samples.mean(0)
+        ).numpy()
+        row["STD_ERR"] = torch.norm(samples.std(0) - true_samples.std(0)).numpy()
+        row["cold_STD_ERR"] = torch.norm(
+            samples.std(0) - true_cold_samples.std(0)
+        ).numpy()
+        row["cold_C2ST"] = c2st(
+            samples[
+                :1000,
+            ],
+            true_cold_samples,
+        ).numpy()[0]
 
         # Metrics df
         if path_metrics.exists():
@@ -229,7 +277,10 @@ def compile_df(basepath: str,) -> pd.DataFrame:
 
 
 def apply_df(
-    df, row_fn=None, *args, **kwargs,
+    df,
+    row_fn=None,
+    *args,
+    **kwargs,
 ):
     """Apply function for each row of dataframe
 
@@ -249,7 +300,10 @@ def apply_df(
 
 
 def clean(
-    row, delete_unused_metrics=True, mmd_clip=True, mmd_clip_print=False,
+    row,
+    delete_unused_metrics=True,
+    mmd_clip=True,
+    mmd_clip_print=False,
 ):
     """Clean rows
 
@@ -425,3 +479,64 @@ def clean(
         row["MMD"] = float("nan")
 
     return row
+
+
+def get_gaussian_linear_uniform_cold_posterior_samples(
+    task,
+    num_observation: int,
+    num_rounds: int,
+    num_samples: int,
+    candidate_batch_size: int = 10000,
+):
+
+    true_cold_samples = []
+
+    sampling_dist = torch.distributions.MultivariateNormal(
+        loc=task.get_observation(num_observation).squeeze(),
+        precision_matrix=task.simulator_params["precision_matrix"] * num_rounds,
+    )
+
+    # Reject samples outside of prior bounds
+    counter = 0
+    num_accepted = 0
+    while num_accepted < num_samples:
+        counter += 1
+        sample = sampling_dist.sample((candidate_batch_size,))
+        within_support = task.prior_dist.support.check(sample)
+        if within_support.any():
+            true_cold_samples.append(sample[within_support])
+            num_accepted += int(within_support.sum())
+
+    return torch.cat(true_cold_samples)[:num_samples]
+
+
+def get_gaussian_linear_cold_posterior_samples(
+    task,
+    num_observation: int,
+    num_rounds: int,
+    num_samples: int,
+):
+
+    precision_matrix = (
+        task.simulator_params["precision_matrix"] * num_rounds
+        # + task.prior_params["precision_matrix"]
+        + torch.eye(task.dim_parameters) * 10
+    )
+
+    loc = torch.matmul(
+        torch.inverse(precision_matrix),
+        (
+            num_rounds
+            * torch.matmul(
+                task.simulator_params["precision_matrix"],
+                task.get_observation(num_observation).reshape(-1),
+            )
+        ),
+    )
+
+    sampling_dist = torch.distributions.MultivariateNormal(
+        loc=loc,
+        precision_matrix=precision_matrix,
+    )
+
+    return sampling_dist.sample((num_samples,))

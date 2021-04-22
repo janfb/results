@@ -12,3 +12,4 @@ params:
   automatic_transforms_enabled: false
   z_score_x: true
   z_score_theta: true
+  cold: false
